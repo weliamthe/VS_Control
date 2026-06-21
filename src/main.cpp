@@ -8,8 +8,8 @@
 #include <addons/TokenHelper.h>
 
 // Data koneksi WiFi
-const char WIFI_SSID[] = "TP-Link_F060 - 6307";
-const char WIFI_PASSWORD[] = "6307310706";
+const char WIFI_SSID[] = "CEIOT";
+const char WIFI_PASSWORD[] = "CE-1OT@!";
 
 // Data koneksi Firebase
 const char API_KEY[] = "AIzaSyBATQH6JMIHjLL6Zn5VkZ9FqnUQ_b63yGI";
@@ -18,7 +18,6 @@ const char USER_EMAIL[] = "esp32_1@device.local";
 const char USER_PASSWORD[] = "12345678";
 
 // Lokasi data di Firebase
-const char DEVICE_PATH[] = "/devices/relay_device_1";
 const char REALTIME_PATH[] = "/devices/relay_device_1/realtime";
 
 // Pengaturan relay
@@ -40,6 +39,8 @@ bool firebaseBeginIssued = false;
 bool firebaseReadyLogged = false;
 bool wifiEventHandlerInstalled = false;
 bool deviceInitialized = false;
+bool preferencesReady = false;
+bool relayStateDirty = false;
 
 // Timer
 unsigned long lastWiFiAttemptMs = 0;
@@ -47,22 +48,25 @@ unsigned long lastFirebaseBeginMs = 0;
 unsigned long lastStreamAttemptMs = 0;
 unsigned long lastInitialReadAttemptMs = 0;
 unsigned long lastDiagnosticsLogMs = 0;
-unsigned long lastHeartbeatMs = 0;
+unsigned long relayStateDirtySinceMs = 0;
 
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 const unsigned long FIREBASE_RETRY_INTERVAL_MS = 10000;
 const unsigned long STREAM_RETRY_INTERVAL_MS = 5000;
 const unsigned long INITIAL_READ_RETRY_INTERVAL_MS = 5000;
 const unsigned long DIAGNOSTICS_LOG_INTERVAL_MS = 60000;
-const unsigned long HEARTBEAT_INTERVAL_MS = 180000;
+const unsigned long RELAY_STATE_SAVE_DELAY_MS = 2000;
 
 // Watchdog
 const unsigned long WDT_TIMEOUT_S = 120;
 unsigned long lastWatchdogFeedMs = 0;
+uint32_t minFreeHeap = UINT32_MAX;
 
 // Preferences (deteksi koneksi pertama)
 Preferences preferences;
 const char PREFS_NS[] = "relay";
+
+void feedWatchdog();
 
 const char *resetReasonText(esp_reset_reason_t reason) {
   switch (reason) {
@@ -86,13 +90,17 @@ void printIpAddress(const IPAddress &ip) {
 
 void logDiagnostics() {
   IPAddress ip = WiFi.localIP();
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
   Serial.printf("[DIAG] uptime=%lus wifi=%d ip=", millis() / 1000UL, WiFi.status());
   printIpAddress(ip);
-  Serial.printf(" firebase=%s stream=%s init=%s heap=%u\n",
+  Serial.printf(" firebase=%s stream=%s init=%s heap=%u minHeap=%u dirty=%s\n",
                 Firebase.ready() ? "ready" : "not-ready",
                 streamStarted ? "on" : "off",
                 initialDataLoaded ? "done" : "pending",
-                ESP.getFreeHeap());
+                freeHeap,
+                minFreeHeap,
+                relayStateDirty ? "yes" : "no");
 }
 
 void maybeLogDiagnostics() {
@@ -102,18 +110,28 @@ void maybeLogDiagnostics() {
 }
 
 void resetFirebaseState() {
+  if (streamStarted) {
+    Firebase.RTDB.endStream(&streamData);
+  }
   initialDataLoaded = false;
   streamStarted = false;
   firebaseBeginIssued = false;
   firebaseReadyLogged = false;
+  lastStreamAttemptMs = 0;
+  lastInitialReadAttemptMs = 0;
 }
 
-String relayPath(int index) {
-  return String(REALTIME_PATH) + "/relay" + String(index + 1);
+void buildRelayPath(int index, char *buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "%s/relay%d", REALTIME_PATH, index + 1);
 }
 
 void setRelayPin(int index, bool isOn) {
   digitalWrite(RELAY_PINS[index], isOn ? HIGH : LOW);
+}
+
+void markRelayStatesDirty() {
+  relayStateDirty = true;
+  relayStateDirtySinceMs = millis();
 }
 
 void setAllRelaysOff() {
@@ -130,26 +148,36 @@ void applyRelayState(int index, bool value) {
   relayStates[index] = value;
   setRelayPin(index, value);
   Serial.printf("relay%d = %s\n", index + 1, value ? "ON" : "OFF");
-
-  preferences.begin(PREFS_NS, false);
-  char key[8];
-  snprintf(key, sizeof(key), "r%d", index + 1);
-  preferences.putBool(key, value);
-  preferences.end();
+  markRelayStatesDirty();
 }
 
 void saveAllRelayStates() {
-  preferences.begin(PREFS_NS, false);
+  if (!preferencesReady) return;
+
   for (int i = 0; i < RELAY_COUNT; i++) {
     char key[8];
     snprintf(key, sizeof(key), "r%d", i + 1);
     preferences.putBool(key, relayStates[i]);
+    feedWatchdog();
   }
-  preferences.end();
+
+  relayStateDirty = false;
+  Serial.println("State relay disimpan ke NVS.");
+}
+
+void maybeSaveRelayStates() {
+  if (!relayStateDirty) return;
+  if (millis() - relayStateDirtySinceMs < RELAY_STATE_SAVE_DELAY_MS) return;
+  saveAllRelayStates();
 }
 
 void restoreRelayStates() {
-  preferences.begin(PREFS_NS, true);
+  if (!preferencesReady) {
+    setAllRelaysOff();
+    Serial.println("Preferences belum siap, relay dibuat OFF sebagai mode aman.");
+    return;
+  }
+
   for (int i = 0; i < RELAY_COUNT; i++) {
     char key[8];
     snprintf(key, sizeof(key), "r%d", i + 1);
@@ -157,22 +185,21 @@ void restoreRelayStates() {
     setRelayPin(i, relayStates[i]);
     Serial.printf("restore relay%d = %s\n", i + 1, relayStates[i] ? "ON" : "OFF");
   }
-  preferences.end();
 }
 
 void applySnapshot(FirebaseJson *json) {
   if (json == nullptr) return;
 
   FirebaseJsonData result;
+  char key[8];
 
-  if (json->get(result, "relay1") && result.success && result.type == "bool")
-    applyRelayState(0, result.boolValue);
-  if (json->get(result, "relay2") && result.success && result.type == "bool")
-    applyRelayState(1, result.boolValue);
-  if (json->get(result, "relay3") && result.success && result.type == "bool")
-    applyRelayState(2, result.boolValue);
-  if (json->get(result, "relay4") && result.success && result.type == "bool")
-    applyRelayState(3, result.boolValue);
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    snprintf(key, sizeof(key), "relay%d", i + 1);
+    if (json->get(result, key) && result.success && result.type == "bool") {
+      applyRelayState(i, result.boolValue);
+    }
+    feedWatchdog();
+  }
 
   if (!initialDataLoaded) {
     initialDataLoaded = true;
@@ -283,28 +310,27 @@ bool initializeDeviceInFirebase() {
   Serial.println("Koneksi pertama terdeteksi, menulis data awal ke Firebase...");
 
   FirebaseJson json;
+  char key[8];
   for (int i = 0; i < RELAY_COUNT; i++) {
-    json.set(String("relay") + String(i + 1), false);
+    snprintf(key, sizeof(key), "relay%d", i + 1);
+    json.set(key, false);
+    feedWatchdog();
   }
 
-  if (Firebase.RTDB.setJSON(&firebaseData, REALTIME_PATH, &json)) {
-    Serial.println("Data relay awal berhasil ditulis ke Firebase.");
+  if (!Firebase.RTDB.setJSON(&firebaseData, REALTIME_PATH, &json)) {
+    Serial.printf("Gagal menulis data awal: %s\n", firebaseData.errorReason().c_str());
+    return false;
+  }
 
-    FirebaseJson deviceJson;
-    deviceJson.set("relayCount", RELAY_COUNT);
-    Firebase.RTDB.setJSON(&firebaseData, DEVICE_PATH, &deviceJson);
-
-    preferences.begin(PREFS_NS, false);
+  if (preferencesReady) {
     preferences.putBool("init", true);
-    preferences.end();
-
-    deviceInitialized = true;
-    initialDataLoaded = true;
-    return true;
   }
 
-  Serial.printf("Gagal menulis data awal: %s\n", firebaseData.errorReason().c_str());
-  return false;
+  deviceInitialized = true;
+  initialDataLoaded = true;
+  markRelayStatesDirty();
+  Serial.println("Data awal Firebase berhasil dibuat.");
+  return true;
 }
 
 void streamCallback(FirebaseStream data) {
@@ -353,20 +379,6 @@ void startStream() {
   }
 }
 
-void sendHeartbeat() {
-  if (!Firebase.ready()) return;
-
-  String path = String(DEVICE_PATH) + "/heartbeat";
-
-  if (Firebase.RTDB.setString(&firebaseData, path, String(millis()))) {
-    lastHeartbeatMs = millis();
-  } else {
-    Serial.printf("Heartbeat gagal: %s\n", firebaseData.errorReason().c_str());
-    streamStarted = false;
-    initialDataLoaded = false;
-  }
-}
-
 bool readInitialRelayStates() {
   if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return false;
   if (initialDataLoaded) return true;
@@ -377,12 +389,15 @@ bool readInitialRelayStates() {
   Serial.println("Membaca status relay dari Firebase...");
 
   bool values[RELAY_COUNT];
+  char path[64];
   for (int i = 0; i < RELAY_COUNT; i++) {
-    if (!Firebase.RTDB.getBool(&firebaseData, relayPath(i))) {
+    buildRelayPath(i, path, sizeof(path));
+    if (!Firebase.RTDB.getBool(&firebaseData, path)) {
       Serial.printf("Gagal baca relay%d: %s\n", i + 1, firebaseData.errorReason().c_str());
       return false;
     }
     values[i] = firebaseData.boolData();
+    feedWatchdog();
   }
 
   for (int i = 0; i < RELAY_COUNT; i++) {
@@ -416,9 +431,12 @@ void setup() {
     pinMode(RELAY_PINS[i], OUTPUT);
   }
 
-  preferences.begin(PREFS_NS, true);
-  deviceInitialized = preferences.getBool("init", false);
-  preferences.end();
+  preferencesReady = preferences.begin(PREFS_NS, false);
+  if (!preferencesReady) {
+    Serial.println("WARNING: Preferences gagal dibuka, state relay tidak akan dipersist.");
+  }
+
+  deviceInitialized = preferencesReady ? preferences.getBool("init", false) : false;
 
   if (!deviceInitialized) {
     setAllRelaysOff();
@@ -434,6 +452,7 @@ void setup() {
 
 void loop() {
   feedWatchdog();
+  maybeSaveRelayStates();
   ensureWiFiConnected();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -472,10 +491,6 @@ void loop() {
 
   if (!initialDataLoaded) {
     readInitialRelayStates();
-  }
-
-  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-    sendHeartbeat();
   }
 
   maybeLogDiagnostics();
