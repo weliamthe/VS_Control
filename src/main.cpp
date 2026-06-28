@@ -8,8 +8,8 @@
 #include <addons/TokenHelper.h>
 
 // Data koneksi WiFi
-const char WIFI_SSID[] = "CEIOT";
-const char WIFI_PASSWORD[] = "CE-1OT@!";
+const char WIFI_SSID[] = "TP-Link_F060 - 6307";
+const char WIFI_PASSWORD[] = "6307310706";
 
 // Data koneksi Firebase
 const char API_KEY[] = "AIzaSyBATQH6JMIHjLL6Zn5VkZ9FqnUQ_b63yGI";
@@ -36,122 +36,90 @@ bool initialDataLoaded = false;
 bool streamStarted = false;
 bool firebaseConfigured = false;
 bool firebaseBeginIssued = false;
-bool firebaseReadyLogged = false;
 bool wifiEventHandlerInstalled = false;
 bool deviceInitialized = false;
 bool preferencesReady = false;
 bool relayStateDirty = false;
+bool wifiConnectedLogged = false;
+bool firebaseReadyLogged = false;
 
 // Timer
 unsigned long lastWiFiAttemptMs = 0;
 unsigned long lastFirebaseBeginMs = 0;
 unsigned long lastStreamAttemptMs = 0;
-unsigned long lastInitialReadAttemptMs = 0;
-unsigned long lastDiagnosticsLogMs = 0;
+unsigned long lastWatchdogFeedMs = 0;
 unsigned long relayStateDirtySinceMs = 0;
+unsigned long streamStartedAtMs = 0;
 
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 const unsigned long FIREBASE_RETRY_INTERVAL_MS = 10000;
 const unsigned long STREAM_RETRY_INTERVAL_MS = 5000;
-const unsigned long INITIAL_READ_RETRY_INTERVAL_MS = 5000;
-const unsigned long DIAGNOSTICS_LOG_INTERVAL_MS = 60000;
 const unsigned long RELAY_STATE_SAVE_DELAY_MS = 2000;
+const unsigned long INITIAL_STREAM_TIMEOUT_MS = 15000;
 
 // Watchdog
 const unsigned long WDT_TIMEOUT_S = 120;
-unsigned long lastWatchdogFeedMs = 0;
-uint32_t minFreeHeap = UINT32_MAX;
 
-// Preferences (deteksi koneksi pertama)
+// Preferences
 Preferences preferences;
 const char PREFS_NS[] = "relay";
 
 void feedWatchdog();
+void makeRelayFieldName(int index, char *buffer, size_t bufferSize);
+int getRelayIndexFromPath(const String &path);
 
-const char *resetReasonText(esp_reset_reason_t reason) {
-  switch (reason) {
-    case ESP_RST_POWERON:   return "Power on";
-    case ESP_RST_EXT:       return "External reset";
-    case ESP_RST_SW:        return "Software reset";
-    case ESP_RST_PANIC:     return "Panic/Guru Meditation";
-    case ESP_RST_INT_WDT:   return "Interrupt watchdog";
-    case ESP_RST_TASK_WDT:  return "Task watchdog";
-    case ESP_RST_WDT:       return "Other watchdog";
-    case ESP_RST_DEEPSLEEP: return "Wake from deep sleep";
-    case ESP_RST_BROWNOUT:  return "Brownout";
-    case ESP_RST_SDIO:      return "SDIO reset";
-    default:                return "Unknown";
-  }
+void makeRelayFieldName(int index, char *buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "relay%d", index + 1);
 }
 
-void printIpAddress(const IPAddress &ip) {
-  Serial.printf("%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+int getRelayIndexFromPath(const String &path) {
+  if (path == "/relay1") return 0;
+  if (path == "/relay2") return 1;
+  if (path == "/relay3") return 2;
+  if (path == "/relay4") return 3;
+  return -1;
 }
 
-void logDiagnostics() {
-  IPAddress ip = WiFi.localIP();
-  uint32_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
-  Serial.printf("[DIAG] uptime=%lus wifi=%d ip=", millis() / 1000UL, WiFi.status());
-  printIpAddress(ip);
-  Serial.printf(" firebase=%s stream=%s init=%s heap=%u minHeap=%u dirty=%s\n",
-                Firebase.ready() ? "ready" : "not-ready",
-                streamStarted ? "on" : "off",
-                initialDataLoaded ? "done" : "pending",
-                freeHeap,
-                minFreeHeap,
-                relayStateDirty ? "yes" : "no");
-}
-
-void maybeLogDiagnostics() {
-  if (millis() - lastDiagnosticsLogMs < DIAGNOSTICS_LOG_INTERVAL_MS) return;
-  logDiagnostics();
-  lastDiagnosticsLogMs = millis();
-}
-
-void resetFirebaseState() {
+void resetFirebaseConnection() {
   if (streamStarted) {
     Firebase.RTDB.endStream(&streamData);
   }
+
   initialDataLoaded = false;
   streamStarted = false;
   firebaseBeginIssued = false;
   firebaseReadyLogged = false;
   lastStreamAttemptMs = 0;
-  lastInitialReadAttemptMs = 0;
+  streamStartedAtMs = 0;
 }
 
-void buildRelayPath(int index, char *buffer, size_t bufferSize) {
-  snprintf(buffer, bufferSize, "%s/relay%d", REALTIME_PATH, index + 1);
-}
-
-void setRelayPin(int index, bool isOn) {
+void writeRelayPin(int index, bool isOn) {
   digitalWrite(RELAY_PINS[index], isOn ? HIGH : LOW);
 }
 
-void markRelayStatesDirty() {
+void markRelayStateChanged() {
   relayStateDirty = true;
   relayStateDirtySinceMs = millis();
 }
 
-void setAllRelaysOff() {
+void turnOffAllRelays() {
   for (int i = 0; i < RELAY_COUNT; i++) {
     relayStates[i] = false;
-    setRelayPin(i, false);
+    writeRelayPin(i, false);
   }
 }
 
-void applyRelayState(int index, bool value) {
+void updateRelayState(int index, bool value) {
   if (index < 0 || index >= RELAY_COUNT) return;
   if (relayStates[index] == value) return;
 
   relayStates[index] = value;
-  setRelayPin(index, value);
-  Serial.printf("relay%d = %s\n", index + 1, value ? "ON" : "OFF");
-  markRelayStatesDirty();
+  writeRelayPin(index, value);
+  markRelayStateChanged();
+  Serial.printf("relay%d %s\n", index + 1, value ? "ON" : "OFF");
 }
 
-void saveAllRelayStates() {
+void saveRelayStates() {
   if (!preferencesReady) return;
 
   for (int i = 0; i < RELAY_COUNT; i++) {
@@ -162,19 +130,17 @@ void saveAllRelayStates() {
   }
 
   relayStateDirty = false;
-  Serial.println("State relay disimpan ke NVS.");
 }
 
-void maybeSaveRelayStates() {
+void saveRelayStatesIfNeeded() {
   if (!relayStateDirty) return;
   if (millis() - relayStateDirtySinceMs < RELAY_STATE_SAVE_DELAY_MS) return;
-  saveAllRelayStates();
+  saveRelayStates();
 }
 
-void restoreRelayStates() {
+void loadSavedRelayStates() {
   if (!preferencesReady) {
-    setAllRelaysOff();
-    Serial.println("Preferences belum siap, relay dibuat OFF sebagai mode aman.");
+    turnOffAllRelays();
     return;
   }
 
@@ -182,59 +148,52 @@ void restoreRelayStates() {
     char key[8];
     snprintf(key, sizeof(key), "r%d", i + 1);
     relayStates[i] = preferences.getBool(key, false);
-    setRelayPin(i, relayStates[i]);
-    Serial.printf("restore relay%d = %s\n", i + 1, relayStates[i] ? "ON" : "OFF");
+    writeRelayPin(i, relayStates[i]);
   }
 }
 
-void applySnapshot(FirebaseJson *json) {
+void applyRelaySnapshot(FirebaseJson *json) {
   if (json == nullptr) return;
 
   FirebaseJsonData result;
   char key[8];
 
   for (int i = 0; i < RELAY_COUNT; i++) {
-    snprintf(key, sizeof(key), "relay%d", i + 1);
+    makeRelayFieldName(i, key, sizeof(key));
     if (json->get(result, key) && result.success && result.type == "bool") {
-      applyRelayState(i, result.boolValue);
+      updateRelayState(i, result.boolValue);
     }
     feedWatchdog();
   }
 
-  if (!initialDataLoaded) {
-    initialDataLoaded = true;
-    Serial.println("Status awal relay dimuat dari stream Firebase.");
-  }
+  initialDataLoaded = true;
 }
 
-void onWiFiEvent(WiFiEvent_t event) {
+void handleWiFiEvent(WiFiEvent_t event) {
   switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.println("[WIFI] Connected to AP.");
-      break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.print("[WIFI] Got IP: ");
-      printIpAddress(WiFi.localIP());
-      Serial.println();
+      wifiConnectedLogged = true;
+      Serial.println("WiFi connected");
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.println("[WIFI] Disconnected from AP.");
-      resetFirebaseState();
+      wifiConnectedLogged = false;
+      Serial.println("WiFi disconnected");
+      resetFirebaseConnection();
       break;
     default:
       break;
   }
 }
 
-void connectWiFi() {
-  Serial.printf("Menghubungkan ke WiFi: %s\n", WIFI_SSID);
+void startWiFi() {
+  Serial.println("Connecting to WiFi...");
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
   if (!wifiEventHandlerInstalled) {
-    WiFi.onEvent(onWiFiEvent);
+    WiFi.onEvent(handleWiFiEvent);
     wifiEventHandlerInstalled = true;
   }
 
@@ -242,17 +201,17 @@ void connectWiFi() {
   lastWiFiAttemptMs = millis();
 }
 
-void ensureWiFiConnected() {
+void reconnectWiFiIfNeeded() {
   if (WiFi.status() == WL_CONNECTED) return;
   if (millis() - lastWiFiAttemptMs < WIFI_RETRY_INTERVAL_MS) return;
 
-  Serial.println("WiFi putus, mencoba sambung lagi...");
+  Serial.println("Reconnecting WiFi...");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWiFiAttemptMs = millis();
 }
 
-void configureFirebase() {
+void setupFirebaseConfig() {
   firebaseConfig.api_key = API_KEY;
   firebaseConfig.database_url = DATABASE_URL;
   firebaseConfig.token_status_callback = tokenStatusCallback;
@@ -264,61 +223,55 @@ void configureFirebase() {
   firebaseConfigured = true;
 }
 
-void beginFirebase() {
+void startFirebase() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (!firebaseConfigured) configureFirebase();
+  if (!firebaseConfigured) setupFirebaseConfig();
   if (firebaseBeginIssued && millis() - lastFirebaseBeginMs < FIREBASE_RETRY_INTERVAL_MS) return;
 
-  Serial.println("Menghubungkan ke Firebase...");
+  Serial.println("Connecting to Firebase...");
   Firebase.begin(&firebaseConfig, &firebaseAuth);
   firebaseBeginIssued = true;
-  firebaseReadyLogged = false;
   lastFirebaseBeginMs = millis();
 }
 
-void ensureFirebaseReady() {
-  if (WiFi.status() != WL_CONNECTED) {
-    firebaseReadyLogged = false;
-    return;
-  }
+void reconnectFirebaseIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
   if (!firebaseBeginIssued) {
-    beginFirebase();
+    startFirebase();
     return;
   }
 
   if (Firebase.ready()) {
     if (!firebaseReadyLogged) {
-      Serial.println("Firebase siap.");
+      Serial.println("Firebase connected");
       firebaseReadyLogged = true;
     }
     return;
   }
 
-  firebaseReadyLogged = false;
-
   if (millis() - lastFirebaseBeginMs >= FIREBASE_RETRY_INTERVAL_MS) {
-    Serial.println("Firebase belum siap, mencoba mulai lagi...");
+    firebaseReadyLogged = false;
+    Serial.println("Retrying Firebase...");
     Firebase.begin(&firebaseConfig, &firebaseAuth);
     lastFirebaseBeginMs = millis();
   }
 }
 
-bool initializeDeviceInFirebase() {
+bool createInitialFirebaseData() {
   if (!Firebase.ready()) return false;
-
-  Serial.println("Koneksi pertama terdeteksi, menulis data awal ke Firebase...");
+  if (deviceInitialized) return true;
 
   FirebaseJson json;
-  char key[8];
   for (int i = 0; i < RELAY_COUNT; i++) {
-    snprintf(key, sizeof(key), "relay%d", i + 1);
+    char key[8];
+    makeRelayFieldName(i, key, sizeof(key));
     json.set(key, false);
     feedWatchdog();
   }
 
-  if (!Firebase.RTDB.setJSON(&firebaseData, REALTIME_PATH, &json)) {
-    Serial.printf("Gagal menulis data awal: %s\n", firebaseData.errorReason().c_str());
+  if (!Firebase.RTDB.setJSONAsync(&firebaseData, REALTIME_PATH, &json)) {
+    Serial.printf("Gagal menjadwalkan data awal: %s\n", firebaseData.errorReason().c_str());
     return false;
   }
 
@@ -327,86 +280,52 @@ bool initializeDeviceInFirebase() {
   }
 
   deviceInitialized = true;
-  initialDataLoaded = true;
-  markRelayStatesDirty();
-  Serial.println("Data awal Firebase berhasil dibuat.");
   return true;
 }
 
-void streamCallback(FirebaseStream data) {
+void handleFirebaseStream(FirebaseStream data) {
   String path = data.dataPath();
   String type = data.dataType();
 
-  Serial.printf("Data berubah. path=%s type=%s\n", path.c_str(), type.c_str());
-
   if (path == "/") {
-    applySnapshot(data.to<FirebaseJson *>());
+    applyRelaySnapshot(data.to<FirebaseJson *>());
     return;
   }
 
   if (type != "boolean") return;
 
-  if (path == "/relay1")       applyRelayState(0, data.boolData());
-  else if (path == "/relay2")  applyRelayState(1, data.boolData());
-  else if (path == "/relay3")  applyRelayState(2, data.boolData());
-  else if (path == "/relay4")  applyRelayState(3, data.boolData());
-  else return;
+  int relayIndex = getRelayIndexFromPath(path);
+  if (relayIndex < 0) return;
 
-  if (!initialDataLoaded) {
-    initialDataLoaded = true;
-    Serial.println("Status relay pertama diterima dari Firebase.");
-  }
+  updateRelayState(relayIndex, data.boolData());
+  initialDataLoaded = true;
 }
 
-void streamTimeoutCallback(bool timeout) {
-  if (timeout) Serial.println("Stream timeout, koneksi akan tetap dipantau.");
-}
-
-void startStream() {
+void startFirebaseStream() {
   if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   if (lastStreamAttemptMs != 0 && millis() - lastStreamAttemptMs < STREAM_RETRY_INTERVAL_MS) return;
 
   lastStreamAttemptMs = millis();
-  Serial.println("Memulai stream Firebase...");
 
   if (Firebase.RTDB.beginStream(&streamData, REALTIME_PATH)) {
-    Firebase.RTDB.setStreamCallback(&streamData, streamCallback, streamTimeoutCallback);
+    Firebase.RTDB.setStreamCallback(&streamData, handleFirebaseStream, nullptr);
     streamStarted = true;
-    Serial.println("Stream Firebase aktif.");
+    streamStartedAtMs = millis();
+    Serial.println("Firebase stream active");
   } else {
     streamStarted = false;
+    streamStartedAtMs = 0;
     Serial.printf("Gagal mulai stream: %s\n", streamData.errorReason().c_str());
   }
 }
 
-bool readInitialRelayStates() {
-  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return false;
-  if (initialDataLoaded) return true;
-  if (lastInitialReadAttemptMs != 0 &&
-      millis() - lastInitialReadAttemptMs < INITIAL_READ_RETRY_INTERVAL_MS) return false;
+void restartStreamIfNoInitialData() {
+  if (!streamStarted || initialDataLoaded) return;
+  if (millis() - streamStartedAtMs < INITIAL_STREAM_TIMEOUT_MS) return;
 
-  lastInitialReadAttemptMs = millis();
-  Serial.println("Membaca status relay dari Firebase...");
-
-  bool values[RELAY_COUNT];
-  char path[64];
-  for (int i = 0; i < RELAY_COUNT; i++) {
-    buildRelayPath(i, path, sizeof(path));
-    if (!Firebase.RTDB.getBool(&firebaseData, path)) {
-      Serial.printf("Gagal baca relay%d: %s\n", i + 1, firebaseData.errorReason().c_str());
-      return false;
-    }
-    values[i] = firebaseData.boolData();
-    feedWatchdog();
-  }
-
-  for (int i = 0; i < RELAY_COUNT; i++) {
-    applyRelayState(i, values[i]);
-  }
-
-  initialDataLoaded = true;
-  Serial.println("Status relay dimuat dari Firebase.");
-  return true;
+  Firebase.RTDB.endStream(&streamData);
+  streamStarted = false;
+  streamStartedAtMs = 0;
 }
 
 void feedWatchdog() {
@@ -418,12 +337,6 @@ void feedWatchdog() {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  Serial.println();
-  Serial.println("ESP32 Relay Firebase Controller");
-  Serial.printf("Reset reason: %s\n", resetReasonText(esp_reset_reason()));
-
   esp_task_wdt_init(WDT_TIMEOUT_S, true);
   esp_task_wdt_add(nullptr);
 
@@ -432,52 +345,41 @@ void setup() {
   }
 
   preferencesReady = preferences.begin(PREFS_NS, false);
-  if (!preferencesReady) {
-    Serial.println("WARNING: Preferences gagal dibuka, state relay tidak akan dipersist.");
-  }
-
   deviceInitialized = preferencesReady ? preferences.getBool("init", false) : false;
 
   if (!deviceInitialized) {
-    setAllRelaysOff();
-    Serial.println("Mode: KONEKSI PERTAMA (relay mati semua)");
+    turnOffAllRelays();
   } else {
-    restoreRelayStates();
-    Serial.println("Mode: RECONNECT (state relay dipulihkan dari NVS)");
+    loadSavedRelayStates();
   }
 
-  connectWiFi();
+  startWiFi();
   lastWatchdogFeedMs = millis();
 }
 
 void loop() {
   feedWatchdog();
-  maybeSaveRelayStates();
-  ensureWiFiConnected();
+  saveRelayStatesIfNeeded();
+  reconnectWiFiIfNeeded();
 
   if (WiFi.status() != WL_CONNECTED) {
-    maybeLogDiagnostics();
-    delay(50);
+    yield();
     return;
   }
 
-  ensureFirebaseReady();
+  reconnectFirebaseIfNeeded();
 
   if (!Firebase.ready()) {
-    maybeLogDiagnostics();
-    delay(50);
+    yield();
     return;
   }
 
   if (!deviceInitialized) {
-    if (!initializeDeviceInFirebase()) {
-      delay(50);
-      return;
-    }
+    createInitialFirebaseData();
   }
 
   if (!streamStarted) {
-    startStream();
+    startFirebaseStream();
   }
 
   if (streamStarted && !Firebase.RTDB.readStream(&streamData)) {
@@ -486,13 +388,10 @@ void loop() {
       Serial.printf("Stream error: %s\n", error.c_str());
       streamStarted = false;
       initialDataLoaded = false;
+      streamStartedAtMs = 0;
     }
   }
 
-  if (!initialDataLoaded) {
-    readInitialRelayStates();
-  }
-
-  maybeLogDiagnostics();
-  delay(50);
+  restartStreamIfNoInitialData();
+  yield();
 }
