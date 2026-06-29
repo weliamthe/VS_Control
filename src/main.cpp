@@ -7,216 +7,281 @@
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
 
-// Data koneksi WiFi
+// =========================
+// Konfigurasi koneksi
+// =========================
+// Kredensial WiFi yang dipakai ESP32 untuk tersambung ke jaringan lokal.
 const char WIFI_SSID[] = "TP-Link_F060 - 6307";
 const char WIFI_PASSWORD[] = "6307310706";
 
-// Data koneksi Firebase
+// Kredensial dan endpoint Firebase Realtime Database.
 const char API_KEY[] = "AIzaSyBATQH6JMIHjLL6Zn5VkZ9FqnUQ_b63yGI";
 const char DATABASE_URL[] = "https://voltsafe-8ead5-default-rtdb.firebaseio.com/";
 const char USER_EMAIL[] = "esp32_1@device.local";
 const char USER_PASSWORD[] = "12345678";
 
-// Lokasi data di Firebase
+// Path utama data relay di Firebase.
 const char REALTIME_PATH[] = "/devices/relay_device_1/realtime";
 
-// Pengaturan relay
+// Mapping jumlah relay dan pin output yang dipakai di ESP32.
 const int RELAY_COUNT = 4;
 const int RELAY_PINS[RELAY_COUNT] = {33, 25, 26, 27};
 
-// Objek utama Firebase
+// =========================
+// Objek library utama
+// =========================
+// `firebaseData` dipakai untuk operasi baca/tulis biasa.
+// `streamData` dipakai khusus untuk koneksi stream realtime.
 FirebaseData firebaseData;
 FirebaseData streamData;
 FirebaseAuth firebaseAuth;
 FirebaseConfig firebaseConfig;
 
-// Status runtime utama untuk mengatur alur program tanpa blocking.
-// Variabel-variabel ini dipakai sebagai penanda state koneksi, stream,
-// inisialisasi perangkat, dan status relay saat program berjalan.
+// =========================
+// Status runtime
+// =========================
+// Menyimpan status relay yang sedang aktif di memori.
 bool relayStates[RELAY_COUNT] = {false, false, false, false};
+
+// Penanda state mesin utama agar kita tahu koneksi dan data sudah sampai mana.
 bool initialDataLoaded = false;
 bool streamStarted = false;
 bool firebaseConfigured = false;
 bool firebaseBeginIssued = false;
+bool firebaseReadyLogged = false;
 bool wifiEventHandlerInstalled = false;
 bool deviceInitialized = false;
 bool preferencesReady = false;
 bool relayStateDirty = false;
-bool wifiConnectedLogged = false;
-bool firebaseReadyLogged = false;
 
-// Timer berbasis millis() untuk retry koneksi dan penyimpanan state relay.
+// =========================
+// Timer berbasis millis()
+// =========================
+// Semua timer di bawah ini dipakai agar program berjalan non-blocking.
+// Jadi tidak ada `delay()` di loop utama, dan tugas periodik dijalankan
+// hanya saat waktunya tiba.
 unsigned long lastWiFiAttemptMs = 0;
 unsigned long lastFirebaseBeginMs = 0;
 unsigned long lastStreamAttemptMs = 0;
-unsigned long lastWatchdogFeedMs = 0;
+unsigned long lastInitialReadAttemptMs = 0;
+unsigned long lastDiagnosticsLogMs = 0;
 unsigned long relayStateDirtySinceMs = 0;
-unsigned long streamStartedAtMs = 0;
+unsigned long lastMainLoopRunMs = 0;
 
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 const unsigned long FIREBASE_RETRY_INTERVAL_MS = 10000;
 const unsigned long STREAM_RETRY_INTERVAL_MS = 5000;
+const unsigned long INITIAL_READ_RETRY_INTERVAL_MS = 5000;
+const unsigned long DIAGNOSTICS_LOG_INTERVAL_MS = 60000;
 const unsigned long RELAY_STATE_SAVE_DELAY_MS = 2000;
-const unsigned long INITIAL_STREAM_TIMEOUT_MS = 15000;
+const unsigned long MAIN_LOOP_INTERVAL_MS = 50;
 
-// Watchdog menjaga agar ESP32 bisa reset otomatis jika loop utama macet
-// atau terlalu lama tidak merespons.
+// =========================
+// Watchdog
+// =========================
+// Watchdog dipakai untuk memastikan firmware tidak hang terlalu lama.
 const unsigned long WDT_TIMEOUT_S = 120;
+unsigned long lastWatchdogFeedMs = 0;
+uint32_t minFreeHeap = UINT32_MAX;
 
-// Preferences dipakai untuk menyimpan status relay terakhir di NVS,
-// sehingga setelah restart perangkat bisa memulihkan kondisi sebelumnya.
+// =========================
+// Preferences / NVS
+// =========================
+// NVS dipakai untuk:
+// 1. Menandai apakah perangkat sudah pernah inisialisasi ke Firebase.
+// 2. Menyimpan status relay terakhir agar bisa dipulihkan setelah restart.
 Preferences preferences;
 const char PREFS_NS[] = "relay";
 
 void feedWatchdog();
-void makeRelayFieldName(int relayIndex, char *relayFieldName, size_t fieldNameSize);
-int getRelayIndexFromPath(const String &relayPath);
+void runControllerCycle();
 
-// Membuat nama field Firebase seperti relay1, relay2, dan seterusnya.
-void makeRelayFieldName(int relayIndex, char *relayFieldName, size_t fieldNameSize) {
-  snprintf(relayFieldName, fieldNameSize, "relay%d", relayIndex + 1);
+const char *resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "Power on";
+    case ESP_RST_EXT:       return "External reset";
+    case ESP_RST_SW:        return "Software reset";
+    case ESP_RST_PANIC:     return "Panic/Guru Meditation";
+    case ESP_RST_INT_WDT:   return "Interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "Task watchdog";
+    case ESP_RST_WDT:       return "Other watchdog";
+    case ESP_RST_DEEPSLEEP: return "Wake from deep sleep";
+    case ESP_RST_BROWNOUT:  return "Brownout";
+    case ESP_RST_SDIO:      return "SDIO reset";
+    default:                return "Unknown";
+  }
 }
 
-// Mengubah path stream Firebase menjadi indeks relay lokal.
-int getRelayIndexFromPath(const String &relayPath) {
-  if (relayPath == "/relay1") return 0;
-  if (relayPath == "/relay2") return 1;
-  if (relayPath == "/relay3") return 2;
-  if (relayPath == "/relay4") return 3;
-  return -1;
+void printIpAddress(const IPAddress &ip) {
+  Serial.printf("%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-// Saat koneksi terputus, status Firebase di-reset agar proses connect
-// dan stream bisa dimulai ulang dengan bersih.
-void resetFirebaseConnection() {
+// Menampilkan status periodik untuk membantu debug saat alat berjalan lama.
+void logDiagnostics() {
+  IPAddress ip = WiFi.localIP();
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
+  Serial.printf("[DIAG] uptime=%lus wifi=%d ip=", millis() / 1000UL, WiFi.status());
+  printIpAddress(ip);
+  Serial.printf(" firebase=%s stream=%s init=%s heap=%u minHeap=%u dirty=%s\n",
+                Firebase.ready() ? "ready" : "not-ready",
+                streamStarted ? "on" : "off",
+                initialDataLoaded ? "done" : "pending",
+                freeHeap,
+                minFreeHeap,
+                relayStateDirty ? "yes" : "no");
+}
+
+// Hanya log jika intervalnya sudah lewat agar serial monitor tidak banjir.
+void maybeLogDiagnostics() {
+  if (millis() - lastDiagnosticsLogMs < DIAGNOSTICS_LOG_INTERVAL_MS) return;
+  logDiagnostics();
+  lastDiagnosticsLogMs = millis();
+}
+
+// Saat WiFi/Firebase putus, status stream dan proses baca awal harus diulang.
+void resetFirebaseState() {
   if (streamStarted) {
     Firebase.RTDB.endStream(&streamData);
   }
-
   initialDataLoaded = false;
   streamStarted = false;
   firebaseBeginIssued = false;
   firebaseReadyLogged = false;
   lastStreamAttemptMs = 0;
-  streamStartedAtMs = 0;
+  lastInitialReadAttemptMs = 0;
 }
 
-// Menulis status ON/OFF langsung ke pin relay fisik.
-void writeRelayPin(int relayIndex, bool isOn) {
-  digitalWrite(RELAY_PINS[relayIndex], isOn ? HIGH : LOW);
+// Membentuk path seperti `/devices/.../relay1`, `/relay2`, dst.
+void buildRelayPath(int index, char *buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "%s/relay%d", REALTIME_PATH, index + 1);
 }
 
-// Menandai bahwa ada perubahan relay yang nanti perlu disimpan ke NVS.
-void markRelayStateChanged() {
+// Memisahkan penulisan pin fisik agar logika relay lebih mudah dibaca.
+void setRelayPin(int index, bool isOn) {
+  digitalWrite(RELAY_PINS[index], isOn ? HIGH : LOW);
+}
+
+// Menandai bahwa state relay berubah dan perlu disimpan ke NVS,
+// tetapi penyimpanan ditunda sebentar agar tidak terlalu sering write flash.
+void markRelayStatesDirty() {
   relayStateDirty = true;
   relayStateDirtySinceMs = millis();
 }
 
-// Dipakai saat startup pertama atau ketika preferences tidak tersedia,
-// agar semua relay masuk ke kondisi aman yaitu OFF.
-void turnOffAllRelays() {
+// Mode aman: semua relay dimatikan.
+void setAllRelaysOff() {
   for (int i = 0; i < RELAY_COUNT; i++) {
     relayStates[i] = false;
-    writeRelayPin(i, false);
+    setRelayPin(i, false);
   }
 }
 
-// Memperbarui status relay di memori dan pin output hanya jika nilainya berubah.
-void updateRelayState(int relayIndex, bool isOn) {
-  if (relayIndex < 0 || relayIndex >= RELAY_COUNT) return;
-  if (relayStates[relayIndex] == isOn) return;
+// Mengubah state relay hanya jika nilainya memang berbeda.
+// Cara ini menghindari penulisan pin yang tidak perlu.
+void applyRelayState(int index, bool value) {
+  if (index < 0 || index >= RELAY_COUNT) return;
+  if (relayStates[index] == value) return;
 
-  relayStates[relayIndex] = isOn;
-  writeRelayPin(relayIndex, isOn);
-  markRelayStateChanged();
-  Serial.printf("relay%d %s\n", relayIndex + 1, isOn ? "ON" : "OFF");
+  relayStates[index] = value;
+  setRelayPin(index, value);
+  Serial.printf("relay%d = %s\n", index + 1, value ? "ON" : "OFF");
+  markRelayStatesDirty();
 }
 
-// Menyimpan semua status relay ke NVS agar bisa dipulihkan saat restart.
-void saveRelayStates() {
+// Menyimpan seluruh state relay ke NVS.
+// Penyimpanan dilakukan dalam satu batch agar state konsisten.
+void saveAllRelayStates() {
   if (!preferencesReady) return;
 
-  for (int relayIndex = 0; relayIndex < RELAY_COUNT; relayIndex++) {
-    char relayStateKey[8];
-    snprintf(relayStateKey, sizeof(relayStateKey), "r%d", relayIndex + 1);
-    preferences.putBool(relayStateKey, relayStates[relayIndex]);
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "r%d", i + 1);
+    preferences.putBool(key, relayStates[i]);
     feedWatchdog();
   }
 
   relayStateDirty = false;
+  Serial.println("State relay disimpan ke NVS.");
 }
 
-// Penyimpanan dibuat tertunda beberapa saat supaya tidak terlalu sering
-// menulis ke flash setiap kali relay berubah.
-void saveRelayStatesIfNeeded() {
+// Menunda write ke flash beberapa saat setelah perubahan terakhir.
+// Tujuannya agar aman untuk flash memory dan tetap responsif.
+void maybeSaveRelayStates() {
   if (!relayStateDirty) return;
   if (millis() - relayStateDirtySinceMs < RELAY_STATE_SAVE_DELAY_MS) return;
-  saveRelayStates();
+  saveAllRelayStates();
 }
 
-// Memuat status relay yang tersimpan sebelumnya dari NVS.
-void loadSavedRelayStates() {
+// Memulihkan state relay terakhir dari NVS setelah restart.
+void restoreRelayStates() {
   if (!preferencesReady) {
-    turnOffAllRelays();
+    setAllRelaysOff();
+    Serial.println("Preferences belum siap, relay dibuat OFF sebagai mode aman.");
     return;
   }
 
-  for (int relayIndex = 0; relayIndex < RELAY_COUNT; relayIndex++) {
-    char relayStateKey[8];
-    snprintf(relayStateKey, sizeof(relayStateKey), "r%d", relayIndex + 1);
-    relayStates[relayIndex] = preferences.getBool(relayStateKey, false);
-    writeRelayPin(relayIndex, relayStates[relayIndex]);
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "r%d", i + 1);
+    relayStates[i] = preferences.getBool(key, false);
+    setRelayPin(i, relayStates[i]);
+    Serial.printf("restore relay%d = %s\n", i + 1, relayStates[i] ? "ON" : "OFF");
   }
 }
 
-// Menerapkan snapshot data penuh dari Firebase ke semua relay lokal.
-void applyRelaySnapshot(FirebaseJson *snapshotJson) {
-  if (snapshotJson == nullptr) return;
+// Menerapkan snapshot lengkap yang datang dari stream Firebase.
+// Snapshot biasanya muncul saat awal stream aktif atau ketika subtree berubah.
+void applySnapshot(FirebaseJson *json) {
+  if (json == nullptr) return;
 
-  FirebaseJsonData relayValue;
-  char relayFieldName[8];
+  FirebaseJsonData result;
+  char key[8];
 
-  for (int relayIndex = 0; relayIndex < RELAY_COUNT; relayIndex++) {
-    makeRelayFieldName(relayIndex, relayFieldName, sizeof(relayFieldName));
-    if (snapshotJson->get(relayValue, relayFieldName) &&
-        relayValue.success &&
-        relayValue.type == "bool") {
-      updateRelayState(relayIndex, relayValue.boolValue);
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    snprintf(key, sizeof(key), "relay%d", i + 1);
+    if (json->get(result, key) && result.success && result.type == "bool") {
+      applyRelayState(i, result.boolValue);
     }
     feedWatchdog();
   }
 
-  initialDataLoaded = true;
+  if (!initialDataLoaded) {
+    initialDataLoaded = true;
+    Serial.println("Status awal relay dimuat dari stream Firebase.");
+  }
 }
 
-// Event WiFi dipakai untuk mendeteksi kapan perangkat berhasil terhubung
-// atau kehilangan koneksi ke access point.
-void handleWiFiEvent(WiFiEvent_t wifiEvent) {
-  switch (wifiEvent) {
+// Event WiFi dipakai untuk mendeteksi perubahan koneksi tanpa polling berat.
+void onWiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[WIFI] Connected to AP.");
+      break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      wifiConnectedLogged = true;
-      Serial.println("WiFi connected");
+      Serial.print("[WIFI] Got IP: ");
+      printIpAddress(WiFi.localIP());
+      Serial.println();
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      wifiConnectedLogged = false;
-      Serial.println("WiFi disconnected");
-      resetFirebaseConnection();
+      Serial.println("[WIFI] Disconnected from AP.");
+      resetFirebaseState();
       break;
     default:
       break;
   }
 }
 
-// Menyiapkan mode WiFi station dan memulai koneksi awal ke router.
-void startWiFi() {
-  Serial.println("Connecting to WiFi...");
+// Setup koneksi WiFi awal.
+void connectWiFi() {
+  Serial.printf("Menghubungkan ke WiFi: %s\n", WIFI_SSID);
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
   if (!wifiEventHandlerInstalled) {
-    WiFi.onEvent(handleWiFiEvent);
+    WiFi.onEvent(onWiFiEvent);
     wifiEventHandlerInstalled = true;
   }
 
@@ -224,19 +289,19 @@ void startWiFi() {
   lastWiFiAttemptMs = millis();
 }
 
-// Jika WiFi terputus, fungsi ini akan mencoba sambung lagi secara berkala.
-void reconnectWiFiIfNeeded() {
+// Retry koneksi WiFi secara berkala tanpa blocking.
+void ensureWiFiConnected() {
   if (WiFi.status() == WL_CONNECTED) return;
   if (millis() - lastWiFiAttemptMs < WIFI_RETRY_INTERVAL_MS) return;
 
-  Serial.println("Reconnecting WiFi...");
+  Serial.println("WiFi putus, mencoba sambung lagi...");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWiFiAttemptMs = millis();
 }
 
-// Konfigurasi dasar Firebase hanya diisi sekali sebelum koneksi dimulai.
-void setupFirebaseConfig() {
+// Mengisi struktur konfigurasi Firebase sekali saja.
+void configureFirebase() {
   firebaseConfig.api_key = API_KEY;
   firebaseConfig.database_url = DATABASE_URL;
   firebaseConfig.token_status_callback = tokenStatusCallback;
@@ -248,59 +313,66 @@ void setupFirebaseConfig() {
   firebaseConfigured = true;
 }
 
-// Memulai autentikasi dan koneksi Firebase setelah WiFi tersedia.
-void startFirebase() {
+// Memulai session Firebase. Fungsi ini aman dipanggil berulang
+// karena ada proteksi interval retry.
+void beginFirebase() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (!firebaseConfigured) setupFirebaseConfig();
+  if (!firebaseConfigured) configureFirebase();
   if (firebaseBeginIssued && millis() - lastFirebaseBeginMs < FIREBASE_RETRY_INTERVAL_MS) return;
 
-  Serial.println("Connecting to Firebase...");
+  Serial.println("Menghubungkan ke Firebase...");
   Firebase.begin(&firebaseConfig, &firebaseAuth);
   firebaseBeginIssued = true;
+  firebaseReadyLogged = false;
   lastFirebaseBeginMs = millis();
 }
 
-// Jika Firebase belum siap, fungsi ini akan mencoba mulai atau mengulang koneksi.
-void reconnectFirebaseIfNeeded() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Menjaga agar Firebase siap dipakai.
+// Jika belum siap, sistem akan mencoba inisialisasi ulang secara periodik.
+void ensureFirebaseReady() {
+  if (WiFi.status() != WL_CONNECTED) {
+    firebaseReadyLogged = false;
+    return;
+  }
 
   if (!firebaseBeginIssued) {
-    startFirebase();
+    beginFirebase();
     return;
   }
 
   if (Firebase.ready()) {
     if (!firebaseReadyLogged) {
-      Serial.println("Firebase connected");
+      Serial.println("Firebase siap.");
       firebaseReadyLogged = true;
     }
     return;
   }
 
+  firebaseReadyLogged = false;
+
   if (millis() - lastFirebaseBeginMs >= FIREBASE_RETRY_INTERVAL_MS) {
-    firebaseReadyLogged = false;
-    Serial.println("Retrying Firebase...");
+    Serial.println("Firebase belum siap, mencoba mulai lagi...");
     Firebase.begin(&firebaseConfig, &firebaseAuth);
     lastFirebaseBeginMs = millis();
   }
 }
 
-// Saat perangkat pertama kali terhubung, data awal relay dibuat di Firebase
-// agar cloud dan device punya struktur data yang sama.
-bool createInitialFirebaseData() {
+// Menulis struktur data awal ke Firebase hanya sekali saat perangkat baru pertama kali aktif.
+bool initializeDeviceInFirebase() {
   if (!Firebase.ready()) return false;
-  if (deviceInitialized) return true;
 
-  FirebaseJson initialRelayJson;
-  for (int relayIndex = 0; relayIndex < RELAY_COUNT; relayIndex++) {
-    char relayFieldName[8];
-    makeRelayFieldName(relayIndex, relayFieldName, sizeof(relayFieldName));
-    initialRelayJson.set(relayFieldName, false);
+  Serial.println("Koneksi pertama terdeteksi, menulis data awal ke Firebase...");
+
+  FirebaseJson json;
+  char key[8];
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    snprintf(key, sizeof(key), "relay%d", i + 1);
+    json.set(key, false);
     feedWatchdog();
   }
 
-  if (!Firebase.RTDB.setJSONAsync(&firebaseData, REALTIME_PATH, &initialRelayJson)) {
-    Serial.printf("Gagal menjadwalkan data awal: %s\n", firebaseData.errorReason().c_str());
+  if (!Firebase.RTDB.setJSON(&firebaseData, REALTIME_PATH, &json)) {
+    Serial.printf("Gagal menulis data awal: %s\n", firebaseData.errorReason().c_str());
     return false;
   }
 
@@ -309,62 +381,95 @@ bool createInitialFirebaseData() {
   }
 
   deviceInitialized = true;
+  initialDataLoaded = true;
+  markRelayStatesDirty();
+  Serial.println("Data awal Firebase berhasil dibuat.");
   return true;
 }
 
-// Callback stream dipanggil saat ada perubahan data dari Firebase.
-// Jika path adalah "/", berarti data snapshot penuh. Jika path spesifik,
-// berarti hanya satu relay yang berubah.
-void handleFirebaseStream(FirebaseStream streamUpdate) {
-  String relayPath = streamUpdate.dataPath();
-  String dataType = streamUpdate.dataType();
+// Callback stream dipanggil setiap ada perubahan data realtime di Firebase.
+void streamCallback(FirebaseStream data) {
+  String path = data.dataPath();
+  String type = data.dataType();
 
-  if (relayPath == "/") {
-    applyRelaySnapshot(streamUpdate.to<FirebaseJson *>());
+  Serial.printf("Data berubah. path=%s type=%s\n", path.c_str(), type.c_str());
+
+  if (path == "/") {
+    applySnapshot(data.to<FirebaseJson *>());
     return;
   }
 
-  if (dataType != "boolean") return;
+  if (type != "boolean") return;
 
-  int relayIndex = getRelayIndexFromPath(relayPath);
-  if (relayIndex < 0) return;
+  if (path == "/relay1")       applyRelayState(0, data.boolData());
+  else if (path == "/relay2")  applyRelayState(1, data.boolData());
+  else if (path == "/relay3")  applyRelayState(2, data.boolData());
+  else if (path == "/relay4")  applyRelayState(3, data.boolData());
+  else return;
 
-  updateRelayState(relayIndex, streamUpdate.boolData());
-  initialDataLoaded = true;
+  if (!initialDataLoaded) {
+    initialDataLoaded = true;
+    Serial.println("Status relay pertama diterima dari Firebase.");
+  }
 }
 
-// Memulai stream realtime Firebase agar perubahan dari cloud bisa diterima
-// tanpa perlu polling manual yang berat.
-void startFirebaseStream() {
+// Timeout stream tidak selalu fatal. Biasanya koneksi masih bisa lanjut.
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) Serial.println("Stream timeout, koneksi akan tetap dipantau.");
+}
+
+// Menyalakan stream realtime jika koneksi WiFi dan Firebase sudah siap.
+void startStream() {
   if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   if (lastStreamAttemptMs != 0 && millis() - lastStreamAttemptMs < STREAM_RETRY_INTERVAL_MS) return;
 
   lastStreamAttemptMs = millis();
+  Serial.println("Memulai stream Firebase...");
 
   if (Firebase.RTDB.beginStream(&streamData, REALTIME_PATH)) {
-    Firebase.RTDB.setStreamCallback(&streamData, handleFirebaseStream, nullptr);
+    Firebase.RTDB.setStreamCallback(&streamData, streamCallback, streamTimeoutCallback);
     streamStarted = true;
-    streamStartedAtMs = millis();
-    Serial.println("Firebase stream active");
+    Serial.println("Stream Firebase aktif.");
   } else {
     streamStarted = false;
-    streamStartedAtMs = 0;
     Serial.printf("Gagal mulai stream: %s\n", streamData.errorReason().c_str());
   }
 }
 
-// Jika terlalu lama belum mendapat data awal dari stream, stream akan di-reset
-// agar perangkat mencoba membangun koneksi realtime yang baru.
-void restartStreamIfNoInitialData() {
-  if (!streamStarted || initialDataLoaded) return;
-  if (millis() - streamStartedAtMs < INITIAL_STREAM_TIMEOUT_MS) return;
+// Fallback pembacaan awal.
+// Jika stream belum sempat memberi snapshot awal, kita baca satu per satu nilai relay.
+bool readInitialRelayStates() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return false;
+  if (initialDataLoaded) return true;
+  if (lastInitialReadAttemptMs != 0 &&
+      millis() - lastInitialReadAttemptMs < INITIAL_READ_RETRY_INTERVAL_MS) return false;
 
-  Firebase.RTDB.endStream(&streamData);
-  streamStarted = false;
-  streamStartedAtMs = 0;
+  lastInitialReadAttemptMs = millis();
+  Serial.println("Membaca status relay dari Firebase...");
+
+  bool values[RELAY_COUNT];
+  char path[64];
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    buildRelayPath(i, path, sizeof(path));
+    if (!Firebase.RTDB.getBool(&firebaseData, path)) {
+      Serial.printf("Gagal baca relay%d: %s\n", i + 1, firebaseData.errorReason().c_str());
+      return false;
+    }
+    values[i] = firebaseData.boolData();
+    feedWatchdog();
+  }
+
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    applyRelayState(i, values[i]);
+  }
+
+  initialDataLoaded = true;
+  Serial.println("Status relay dimuat dari Firebase.");
+  return true;
 }
 
-// Watchdog di-feed secara berkala agar ESP32 tahu bahwa loop utama masih sehat.
+// Watchdog tidak perlu di-reset pada setiap iterasi CPU.
+// Cukup periodik agar overhead kecil tetapi tetap aman.
 void feedWatchdog() {
   if (millis() - lastWatchdogFeedMs >= 1000) {
     esp_task_wdt_reset();
@@ -372,13 +477,13 @@ void feedWatchdog() {
   }
 }
 
-// Setup
-// 1. mulai serial dan watchdog
-// 2. siapkan pin relay
-// 3. muat state relay lama jika ada
-// 4. mulai koneksi WiFi
 void setup() {
   Serial.begin(115200);
+
+  Serial.println();
+  Serial.println("ESP32 Relay Firebase Controller");
+  Serial.printf("Reset reason: %s\n", resetReasonText(esp_reset_reason()));
+
   esp_task_wdt_init(WDT_TIMEOUT_S, true);
   esp_task_wdt_add(nullptr);
 
@@ -387,60 +492,79 @@ void setup() {
   }
 
   preferencesReady = preferences.begin(PREFS_NS, false);
+  if (!preferencesReady) {
+    Serial.println("WARNING: Preferences gagal dibuka, state relay tidak akan dipersist.");
+  }
+
   deviceInitialized = preferencesReady ? preferences.getBool("init", false) : false;
 
   if (!deviceInitialized) {
-    turnOffAllRelays();
+    setAllRelaysOff();
+    Serial.println("Mode: KONEKSI PERTAMA (relay mati semua)");
   } else {
-    loadSavedRelayStates();
+    restoreRelayStates();
+    Serial.println("Mode: RECONNECT (state relay dipulihkan dari NVS)");
   }
 
-  startWiFi();
+  connectWiFi();
   lastWatchdogFeedMs = millis();
 }
 
-// Loop utama dibuat non-blocking:
-// - feed watchdog
-// - simpan state relay bila perlu
-// - jaga koneksi WiFi dan Firebase
-// - pastikan stream aktif
-// - proses perubahan dari cloud
-// Seluruh alur memakai pengecekan state dan millis(), tanpa delay panjang.
-void loop() {
+// Satu siklus kerja utama controller.
+// Fungsi ini dipisah dari `loop()` agar alur state machine lebih mudah dibaca.
+void runControllerCycle() {
   feedWatchdog();
-  saveRelayStatesIfNeeded();
-  reconnectWiFiIfNeeded();
+  maybeSaveRelayStates();
+  ensureWiFiConnected();
 
   if (WiFi.status() != WL_CONNECTED) {
-    yield();
+    maybeLogDiagnostics();
     return;
   }
 
-  reconnectFirebaseIfNeeded();
+  ensureFirebaseReady();
 
   if (!Firebase.ready()) {
-    yield();
+    maybeLogDiagnostics();
     return;
   }
 
   if (!deviceInitialized) {
-    createInitialFirebaseData();
-  }
-
-  if (!streamStarted) {
-    startFirebaseStream();
-  }
-
-  if (streamStarted && !Firebase.RTDB.readStream(&streamData)) {
-    String streamError = streamData.errorReason();
-    if (streamError.length() > 0 && streamError != "stream timeout") {
-      Serial.printf("Stream error: %s\n", streamError.c_str());
-      streamStarted = false;
-      initialDataLoaded = false;
-      streamStartedAtMs = 0;
+    if (!initializeDeviceInFirebase()) {
+      return;
     }
   }
 
-  restartStreamIfNoInitialData();
-  yield();
+  if (!streamStarted) {
+    startStream();
+  }
+
+  if (streamStarted && !Firebase.RTDB.readStream(&streamData)) {
+    String error = streamData.errorReason();
+    if (error.length() > 0 && error != "stream timeout") {
+      Serial.printf("Stream error: %s\n", error.c_str());
+      streamStarted = false;
+      initialDataLoaded = false;
+    }
+  }
+
+  if (!initialDataLoaded) {
+    readInitialRelayStates();
+  }
+
+  maybeLogDiagnostics();
+}
+
+void loop() {
+  // Scheduler sederhana berbasis millis().
+  // Dengan pola ini loop tetap berputar cepat, tetapi pekerjaan utama
+  // hanya dijalankan setiap 50 ms tanpa memblokir CPU memakai `delay()`.
+  feedWatchdog();
+
+  if (lastMainLoopRunMs != 0 && millis() - lastMainLoopRunMs < MAIN_LOOP_INTERVAL_MS) {
+    return;
+  }
+
+  lastMainLoopRunMs = millis();
+  runControllerCycle();
 }
