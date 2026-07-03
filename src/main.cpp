@@ -11,8 +11,8 @@
 // Konfigurasi koneksi
 // =========================
 // Kredensial WiFi yang dipakai ESP32 untuk tersambung ke jaringan lokal.
-const char WIFI_SSID[] = "TP-Link_F060 - 6307";
-const char WIFI_PASSWORD[] = "6307310706";
+const char WIFI_SSID[] = "SSID";
+const char WIFI_PASSWORD[] = "PASSWORD";
 
 // Kredensial dan endpoint Firebase Realtime Database.
 const char API_KEY[] = "AIzaSyBATQH6JMIHjLL6Zn5VkZ9FqnUQ_b63yGI";
